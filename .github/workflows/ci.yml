@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest -r app/requirements.txt
+      - run: pytest -v tests
+
+  # Starts real Kafka in Docker, sends 300 messages and checks the consumer
+  # handled every one of them correctly
+  end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Kafka and create topics
+        run: |
+          docker compose up -d kafka
+          docker compose run --rm kafka-init
+
+      - name: Produce 300 messages
+        run: |
+          docker compose run --rm producer \
+            python producer.py --count 300 --rate 100 --bad-rate 0.05 --dup-rate 0.05 \
+            | tee producer.log
+
+      - name: Consume until idle
+        run: |
+          docker compose run --rm consumer \
+            python consumer.py --exit-when-idle 15 \
+            | tee consumer.log
+
+      - name: Check the numbers add up
+        run: |
+          python - <<'EOF'
+          import json, re
+          sent = json.loads(re.search(r"Sent: (\{.*\})", open("producer.log").read()).group(1))
+          got = json.loads(re.search(r"SUMMARY (\{.*\})", open("consumer.log").read()).group(1))
+          print("sent", sent, "\nconsumed", got)
+          assert got["processed"] == sent["ok"], "every good message processed once"
+          assert got["duplicates"] == sent["duplicate"], "every duplicate skipped"
+          assert got["dead_lettered"] == sent["broken"], "every broken message dead-lettered"
+          EOF
+
+      - name: Show the dead letter topic
+        run: |
+          docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 --topic transactions.dlq \
+            --from-beginning --timeout-ms 5000 --property print.headers=true || true
+
+      - name: Logs if something failed
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop
+        if: always()
+        run: docker compose down -v
